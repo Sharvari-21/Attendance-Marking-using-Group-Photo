@@ -3,6 +3,7 @@ import uuid
 from flask import Blueprint, request, jsonify
 from werkzeug.utils import secure_filename
 from services.face_service import FaceService
+from services.local_storage_service import LocalStorageService
 from config.settings import UPLOAD_FOLDER
 
 face_routes = Blueprint('face_routes', __name__)
@@ -94,7 +95,7 @@ def recognize_group():
     image_path = save_temp_file(image)
     
     try:
-        # Process the group image
+        # Process the group image using local storage for faster recognition
         success, message, recognized_students = FaceService.recognize_faces_in_group(image_path)
         
         # Clean up temporary file
@@ -115,3 +116,27 @@ def recognize_group():
         if os.path.exists(image_path):
             os.remove(image_path)
         return jsonify({"success": False, "message": f"Server error: {str(e)}"}), 500
+
+@face_routes.route('/api/sync-images', methods=['POST'])
+def sync_images():
+    """Sync all student images from Cloudinary to local storage"""
+    try:
+        synced_count = FaceService.sync_all_students()
+        return jsonify({
+            "success": True, 
+            "message": f"Successfully synced {synced_count} students to local storage"
+        })
+    except Exception as e:
+        return jsonify({"success": False, "message": f"Sync error: {str(e)}"}), 500
+
+@face_routes.route('/api/clear-local-storage', methods=['POST'])
+def clear_local_storage():
+    """Clear all local storage and force re-download"""
+    try:
+        LocalStorageService.clear_all_students()
+        return jsonify({
+            "success": True, 
+            "message": "Successfully cleared local storage"
+        })
+    except Exception as e:
+        return jsonify({"success": False, "message": f"Error: {str(e)}"}), 500

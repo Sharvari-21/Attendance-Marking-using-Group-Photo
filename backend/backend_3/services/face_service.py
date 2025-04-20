@@ -1,11 +1,11 @@
 import os
 import cv2
 import numpy as np
-import requests
 import uuid
 from deepface import DeepFace
 from models.student import Student
 from services.cloudinary_service import CloudinaryService
+from services.local_storage_service import LocalStorageService
 from utils.image_utils import check_image_quality
 from config.settings import (
     FACE_MODEL, 
@@ -106,12 +106,35 @@ class FaceService:
             image_urls[image_index] = upload_result["secure_url"]
             student_id = Student.create(name, roll_no, student_class, image_urls)
         
+        # Sync this image to local storage
+        student = Student.get_by_roll_no(roll_no)
+        if student:
+            student_id = str(student["_id"])
+            LocalStorageService.sync_student_images(student_id, student.get("image_urls", []))
+        
         return True, f"Image {image_index+1} processed successfully", student_id
+    
+    @staticmethod
+    def sync_all_students():
+        """Sync all student images to local storage"""
+        all_students = Student.get_all()
+        synced_count = 0
+        
+        for student in all_students:
+            student_id = str(student["_id"])
+            image_urls = student.get("image_urls", [])
+            
+            # Only sync if student has at least one image
+            if any(image_urls):
+                if LocalStorageService.sync_student_images(student_id, image_urls):
+                    synced_count += 1
+        
+        return synced_count
     
     @staticmethod
     def recognize_faces_in_group(group_image_path):
         """
-        Recognize students in a group photo
+        Recognize students in a group photo using locally stored images
         
         Args:
             group_image_path: Path to group image
@@ -141,78 +164,61 @@ class FaceService:
             all_students = Student.get_all()
             recognized_students = []
             
-            # For each student in the database
+            # First ensure all students are synced to local storage
             for student in all_students:
-                # Skip students with incomplete image data
+                student_id = str(student["_id"])
                 image_urls = student.get("image_urls", [])
-                if not image_urls or len(image_urls) == 0 or None in image_urls:
+                
+                # Skip students with no images
+                if not any(image_urls):
                     continue
-                    
+                
+                # Sync if not already synced
+                if not LocalStorageService.is_student_synced(student_id):
+                    LocalStorageService.sync_student_images(student_id, image_urls)
+            
+            # Now perform recognition using local files
+            for student in all_students:
                 student_id = str(student["_id"])
                 student_name = student["name"]
+                student_roll_no = student["roll_no"]
+                student_class = student["class"]
                 
-                # Create a temp folder for this verification
-                temp_student_folder = os.path.join("temp_uploads", f"temp_{student_id}")
-                os.makedirs(temp_student_folder, exist_ok=True)
+                # Get local image paths for this student
+                image_paths = LocalStorageService.get_student_image_paths(student_id)
                 
-                # Download and save at least one reference image
-                reference_img_path = None
-                
-
-                # Inside your loop over image_urls
-                for i, url in enumerate(image_urls):
-                    if url:
-                        try:
-                            response = requests.get(url, stream=True)
-                            if response.status_code == 200:
-                                temp_img_path = os.path.join(temp_student_folder, f"ref_{i}.jpg")
-                                with open(temp_img_path, 'wb') as out_file:
-                                    out_file.write(response.content)
-                                reference_img_path = temp_img_path
-                                break  # Stop after first valid image
-                        except Exception as e:
-                            print(f"Error downloading reference image: {str(e)}")
-
-                
-                # If we couldn't get a reference image, skip this student
-                if not reference_img_path:
+                # Skip if no local images available
+                if not image_paths:
                     continue
                 
                 # Try to verify student against any of the detected faces
                 student_found = False
-                try:
-                    # For efficiency, we first check if any of the detected faces matches this student
-                    # Instead of creating multiple temp files, we could convert the faces to a format
-                    # that DeepFace.verify can accept directly in memory
-                    verification = DeepFace.verify(
-                        img1_path=group_image_path,
-                        img2_path=reference_img_path,
-                        model_name=FACE_MODEL,
-                        distance_metric=FACE_DISTANCE_METRIC,
-                        enforce_detection=False  # Already detected
-                    )
-                    
-                    if verification.get('verified', False):
-                        student_found = True
-                except Exception as e:
-                    print(f"Verification error for {student_name}: {str(e)}")
+                
+                # For better accuracy, try all available images
+                for reference_img_path in image_paths:
+                    try:
+                        verification = DeepFace.verify(
+                            img1_path=group_image_path,
+                            img2_path=reference_img_path,
+                            model_name=FACE_MODEL,
+                            distance_metric=FACE_DISTANCE_METRIC,
+                            enforce_detection=False  # Already detected
+                        )
+                        
+                        if verification.get('verified', False):
+                            student_found = True
+                            break  # No need to check other images
+                    except Exception as e:
+                        print(f"Verification error for {student_name} with image {reference_img_path}: {str(e)}")
                 
                 # If student found, add to recognized list if not already there
                 if student_found:
-                    if not any(s.get('roll_no') == student['roll_no'] for s in recognized_students):
+                    if not any(s.get('roll_no') == student_roll_no for s in recognized_students):
                         recognized_students.append({
-                            'name': student['name'],
-                            'roll_no': student['roll_no'],
-                            'class': student['class']
-                        })
-                
-                # Clean up temp files
-                try:
-                    if os.path.exists(temp_student_folder):
-                        import shutil
-                        shutil.rmtree(temp_student_folder)
-                except Exception as e:
-                    print(f"Error cleaning up temp files: {str(e)}")
+                            'name': student_name,
+                            'roll_no': student_roll_no,
+                            'class': student_class
+                            })
             
             # Check if number of recognized students exceeds number of detected faces
             if len(recognized_students) > len(detected_faces):
